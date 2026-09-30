@@ -1,632 +1,268 @@
-import re
-import sqlite3
-from pathlib import Path
-from uuid import uuid4
-
-from fastapi import FastAPI, HTTPException
+import datetime
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, EmailStr
 
+from database import get_db_connection, init_db
+from exporter import generate_excel_report
+from logger import logger
+from service import process_and_segment_customer
 
-app = FastAPI()
+app = FastAPI(
+    title="FairCRM Platform API",
+    description="Full-stack CRM Platform Backend",
+    version="2.0.0"
+)
 
-
+# ==========================================
+# 1. CORS MIDDLEWARE (Tüm Origin/Portlara Tam İzin)
+# ==========================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,  # Wildcard (*) kullanıldığında allow_credentials=False olmalıdır
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-DATABASE_PATH = Path(__file__).with_name("faircrm.db")
+# ==========================================
+# 2. PYDANTIC SCHEMAS (Frontend Uyumlu)
+# ==========================================
 
-
-# =========================
-# MODELS
-# =========================
-
-class ContactCreate(BaseModel):
+class ContactBase(BaseModel):
     firstName: str
     lastName: str
     company: str
     email: str
-    phone: str
     status: str
     lastContact: str
+    phone: str
 
-    @field_validator("email")
-    @classmethod
-    def validate_email(cls, value: str):
-        value = value.strip()
+class ContactCreate(ContactBase):
+    pass
 
-        email_pattern = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+class ContactResponse(ContactBase):
+    id: str
 
-        if not re.match(email_pattern, value):
-            raise ValueError("Please enter a valid email address")
-
-        return value
-
-    @field_validator("phone")
-    @classmethod
-    def validate_phone(cls, value: str):
-        value = value.strip()
-
-        if not value.isdigit():
-            raise ValueError("Phone number must contain only numbers")
-
-        if len(value) < 7:
-            raise ValueError("Phone number is too short")
-
-        return value
-
-
-class DealCreate(BaseModel):
+class DealBase(BaseModel):
     title: str
     contact_id: str
-    value: int
+    value: float
     stage: str
 
+class DealCreate(DealBase):
+    pass
 
-class TaskCreate(BaseModel):
-    title: str
-    status: str = "pending"
-    dueDate: str
+class DealResponse(DealBase):
+    id: str
+    created_at: str
 
+class DashboardData(BaseModel):
+    total_contacts: int
+    total_deals: int
+    total_value: float
+    won_deals: int
 
-class TaskUpdate(BaseModel):
-    title: str
-    status: str
-    dueDate: str
-
-
-# =========================
-# DATABASE
-# =========================
-
-def get_connection():
-    connection = sqlite3.connect(DATABASE_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-# =========================
-# ROW CONVERTERS
-# =========================
-
-def contact_from_row(row: sqlite3.Row):
-    return {
-        "id": str(row["id"]),
-        "firstName": row["firstName"],
-        "lastName": row["lastName"],
-        "company": row["company"],
-        "email": row["email"],
-        "phone": row["phone"],
-        "status": row["status"],
-        "lastContact": row["lastContact"],
-    }
+class CustomerIngestSchema(BaseModel):
+    external_id: str
+    full_name: str
+    email: EmailStr
+    phone: str
+    total_spent: float
+    country: Optional[str] = "TR"
 
 
-def deal_from_row(row: sqlite3.Row):
-    return {
-        "id": row["id"],
-        "title": row["title"],
-        "contact_id": row["contact_id"],
-        "value": row["value"],
-        "stage": row["stage"],
-        "created_at": row["created_at"],
-    }
+# ==========================================
+# 3. STARTUP EVENT
+# ==========================================
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    logger.info("FairCRM Veritabanı ve Tablolar Hazır.")
 
 
-def task_from_row(row: sqlite3.Row):
-    return {
-        "id": str(row["id"]),
-        "title": row["title"],
-        "status": row["status"],
-        "dueDate": row["due_date"],
-    }
+# ==========================================
+# 4. CONTACTS ENDPOINTS (CRUD)
+# ==========================================
 
-
-# =========================
-# DATABASE INITIALIZATION
-# =========================
-
-def initialize_database():
-    database_exists = DATABASE_PATH.exists()
-
-    with get_connection() as connection:
-
-        # CONTACTS
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS contacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                firstName TEXT NOT NULL,
-                lastName TEXT NOT NULL,
-                company TEXT NOT NULL,
-                email TEXT NOT NULL,
-                phone TEXT NOT NULL,
-                status TEXT NOT NULL,
-                lastContact TEXT NOT NULL
-            )
-            """
-        )
-
-        # TASKS
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL,
-                due_date TEXT NOT NULL
-            )
-            """
-        )
-
-        # DEALS
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS deals (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                contact_id TEXT NOT NULL,
-                value INTEGER NOT NULL,
-                stage TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        # SAMPLE CONTACTS
-        if not database_exists:
-            connection.executemany(
-                """
-                INSERT INTO contacts
-                    (
-                        firstName,
-                        lastName,
-                        company,
-                        email,
-                        phone,
-                        status,
-                        lastContact
-                    )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        "Ali",
-                        "Yılmaz",
-                        "FairCRM",
-                        "ali@faircrm.com",
-                        "5551111111",
-                        "active",
-                        "2026-08-15",
-                    ),
-                    (
-                        "Veli",
-                        "Demir",
-                        "Acme Corp",
-                        "veli@acme.com",
-                        "5552222222",
-                        "lead",
-                        "2026-08-12",
-                    ),
-                ],
-            )
-
-            # SAMPLE DEALS
-            connection.executemany(
-                """
-                INSERT INTO deals
-                    (
-                        id,
-                        title,
-                        contact_id,
-                        value,
-                        stage,
-                        created_at
-                    )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        "deal-1",
-                        "Website Redesign",
-                        "1",
-                        12000,
-                        "proposal",
-                        "2026-08-20",
-                    ),
-                    (
-                        "deal-2",
-                        "CRM Expansion",
-                        "2",
-                        8500,
-                        "qualified",
-                        "2026-08-21",
-                    ),
-                ],
-            )
-
-
-initialize_database()
-
-
-# =========================
-# CONTACTS
-# =========================
-
-@app.get("/contacts")
+@app.get("/contacts", response_model=List[ContactResponse])
 def get_contacts():
-    with get_connection() as connection:
-        rows = connection.execute(
-            "SELECT * FROM contacts ORDER BY id"
-        ).fetchall()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, firstName, lastName, company, email, status, lastContact, phone FROM contacts ORDER BY id DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
-    return [contact_from_row(row) for row in rows]
+@app.post("/contacts", response_model=ContactResponse, status_code=status.HTTP_201_CREATED)
+def create_contact(payload: ContactCreate):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM contacts")
+    count = cursor.fetchone()[0]
+    new_id = f"c{count + 1}"
 
+    cursor.execute("""
+        INSERT INTO contacts (id, firstName, lastName, company, email, status, lastContact, phone)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (new_id, payload.firstName, payload.lastName, payload.company, payload.email, payload.status, payload.lastContact, payload.phone))
+    
+    conn.commit()
+    conn.close()
+    return {**payload.dict(), "id": new_id}
 
-@app.post("/contacts")
-def create_contact(contact: ContactCreate):
-    with get_connection() as connection:
+@app.put("/contacts/{contact_id}", response_model=ContactResponse)
+def update_contact(contact_id: str, payload: ContactCreate):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        UPDATE contacts 
+        SET firstName = ?, lastName = ?, company = ?, email = ?, status = ?, lastContact = ?, phone = ?
+        WHERE id = ?
+    """, (payload.firstName, payload.lastName, payload.company, payload.email, payload.status, payload.lastContact, payload.phone, contact_id))
+    
+    if cursor.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Contact not found")
+        
+    conn.commit()
+    conn.close()
+    return {**payload.dict(), "id": contact_id}
 
-        cursor = connection.execute(
-            """
-            INSERT INTO contacts
-                (
-                    firstName,
-                    lastName,
-                    company,
-                    email,
-                    phone,
-                    status,
-                    lastContact
-                )
-            VALUES
-                (
-                    :firstName,
-                    :lastName,
-                    :company,
-                    :email,
-                    :phone,
-                    :status,
-                    :lastContact
-                )
-            """,
-            contact.model_dump(),
-        )
-
-        row = connection.execute(
-            "SELECT * FROM contacts WHERE id = ?",
-            (cursor.lastrowid,),
-        ).fetchone()
-
-    return contact_from_row(row)
-
-
-@app.put("/contacts/{contact_id}")
-def update_contact(contact_id: str, contact: ContactCreate):
-    with get_connection() as connection:
-
-        cursor = connection.execute(
-            """
-            UPDATE contacts
-            SET
-                firstName = :firstName,
-                lastName = :lastName,
-                company = :company,
-                email = :email,
-                phone = :phone,
-                status = :status,
-                lastContact = :lastContact
-            WHERE id = :id
-            """,
-            {
-                **contact.model_dump(),
-                "id": contact_id,
-            },
-        )
-
-        if cursor.rowcount == 0:
-            raise HTTPException(
-                status_code=404,
-                detail="Contact not found",
-            )
-
-        row = connection.execute(
-            "SELECT * FROM contacts WHERE id = ?",
-            (contact_id,),
-        ).fetchone()
-
-    return contact_from_row(row)
-
-
-@app.delete("/contacts/{contact_id}")
+@app.delete("/contacts/{contact_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_contact(contact_id: str):
-    with get_connection() as connection:
-
-        cursor = connection.execute(
-            "DELETE FROM contacts WHERE id = ?",
-            (contact_id,),
-        )
-
-    if cursor.rowcount == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Contact not found",
-        )
-
-    return {
-        "message": "Contact deleted"
-    }
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+    conn.commit()
+    conn.close()
+    return None
 
 
-# =========================
-# TASKS
-# =========================
+# ==========================================
+# 5. DEALS ENDPOINTS (CRUD)
+# ==========================================
 
-@app.get("/tasks")
-def get_tasks():
-    with get_connection() as connection:
-
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM tasks
-            ORDER BY due_date ASC
-            """
-        ).fetchall()
-
-    return [task_from_row(row) for row in rows]
-
-
-@app.post("/tasks")
-def create_task(task: TaskCreate):
-
-    new_task = {
-        "id": str(uuid4()),
-        "title": task.title,
-        "status": task.status,
-        "dueDate": task.dueDate,
-    }
-
-    with get_connection() as connection:
-
-        connection.execute(
-            """
-            INSERT INTO tasks
-                (
-                    id,
-                    title,
-                    status,
-                    due_date
-                )
-            VALUES
-                (
-                    :id,
-                    :title,
-                    :status,
-                    :dueDate
-                )
-            """,
-            new_task,
-        )
-
-        row = connection.execute(
-            "SELECT * FROM tasks WHERE id = ?",
-            (new_task["id"],),
-        ).fetchone()
-
-    return task_from_row(row)
-
-
-@app.put("/tasks/{task_id}")
-def update_task(task_id: str, task: TaskUpdate):
-
-    with get_connection() as connection:
-
-        cursor = connection.execute(
-            """
-            UPDATE tasks
-            SET
-                title = :title,
-                status = :status,
-                due_date = :dueDate
-            WHERE id = :id
-            """,
-            {
-                **task.model_dump(),
-                "id": task_id,
-            },
-        )
-
-        if cursor.rowcount == 0:
-            raise HTTPException(
-                status_code=404,
-                detail="Task not found",
-            )
-
-        row = connection.execute(
-            "SELECT * FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-
-    return task_from_row(row)
-
-
-@app.delete("/tasks/{task_id}")
-def delete_task(task_id: str):
-
-    with get_connection() as connection:
-
-        cursor = connection.execute(
-            "DELETE FROM tasks WHERE id = ?",
-            (task_id,),
-        )
-
-    if cursor.rowcount == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Task not found",
-        )
-
-    return {
-        "message": "Task deleted"
-    }
-
-
-# =========================
-# DEALS
-# =========================
-
-@app.get("/deals")
+@app.get("/deals", response_model=List[DealResponse])
 def get_deals():
-    with get_connection() as connection:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title, contact_id, value, stage, created_at FROM deals ORDER BY id DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM deals
-            ORDER BY created_at DESC
-            """
-        ).fetchall()
+@app.post("/deals", response_model=DealResponse, status_code=status.HTTP_201_CREATED)
+def create_deal(payload: DealCreate):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM deals")
+    count = cursor.fetchone()[0]
+    new_id = f"d{count + 1}"
+    created_at = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    return [deal_from_row(row) for row in rows]
+    cursor.execute("""
+        INSERT INTO deals (id, title, contact_id, value, stage, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (new_id, payload.title, payload.contact_id, payload.value, payload.stage, created_at))
+    
+    conn.commit()
+    conn.close()
+    return {**payload.dict(), "id": new_id, "created_at": created_at}
 
-
-@app.post("/deals")
-def create_deal(deal: DealCreate):
-
-    new_deal = {
-        "id": str(uuid4()),
-        **deal.model_dump(),
-    }
-
-    with get_connection() as connection:
-
-        connection.execute(
-            """
-            INSERT INTO deals
-                (
-                    id,
-                    title,
-                    contact_id,
-                    value,
-                    stage,
-                    created_at
-                )
-            VALUES
-                (
-                    :id,
-                    :title,
-                    :contact_id,
-                    :value,
-                    :stage,
-                    date('now')
-                )
-            """,
-            new_deal,
-        )
-
-        row = connection.execute(
-            "SELECT * FROM deals WHERE id = ?",
-            (new_deal["id"],),
-        ).fetchone()
-
-    return deal_from_row(row)
-
-
-@app.put("/deals/{deal_id}")
-def update_deal(deal_id: str, deal: DealCreate):
-
-    with get_connection() as connection:
-
-        cursor = connection.execute(
-            """
-            UPDATE deals
-            SET
-                title = :title,
-                contact_id = :contact_id,
-                value = :value,
-                stage = :stage
-            WHERE id = :id
-            """,
-            {
-                **deal.model_dump(),
-                "id": deal_id,
-            },
-        )
-
-        if cursor.rowcount == 0:
-            raise HTTPException(
-                status_code=404,
-                detail="Deal not found",
-            )
-
-        row = connection.execute(
-            "SELECT * FROM deals WHERE id = ?",
-            (deal_id,),
-        ).fetchone()
-
-    return deal_from_row(row)
-
-
-@app.delete("/deals/{deal_id}")
-def delete_deal(deal_id: str):
-
-    with get_connection() as connection:
-
-        cursor = connection.execute(
-            "DELETE FROM deals WHERE id = ?",
-            (deal_id,),
-        )
-
+@app.put("/deals/{deal_id}", response_model=DealResponse)
+def update_deal(deal_id: str, payload: DealCreate):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        UPDATE deals 
+        SET title = ?, contact_id = ?, value = ?, stage = ?
+        WHERE id = ?
+    """, (payload.title, payload.contact_id, payload.value, payload.stage, deal_id))
+    
     if cursor.rowcount == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Deal not found",
-        )
+        conn.close()
+        raise HTTPException(status_code=404, detail="Deal not found")
+        
+    cursor.execute("SELECT created_at FROM deals WHERE id = ?", (deal_id,))
+    created_at = cursor.fetchone()[0]
+    
+    conn.commit()
+    conn.close()
+    return {**payload.dict(), "id": deal_id, "created_at": created_at}
 
-    return {
-        "message": "Deal deleted"
-    }
+@app.delete("/deals/{deal_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_deal(deal_id: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM deals WHERE id = ?", (deal_id,))
+    conn.commit()
+    conn.close()
+    return None
 
 
-# =========================
-# DASHBOARD
-# =========================
+# ==========================================
+# 6. DASHBOARD METRICS ENDPOINT
+# ==========================================
 
-@app.get("/dashboard")
-def get_dashboard():
-
-    with get_connection() as connection:
-
-        total_contacts = connection.execute(
-            "SELECT COUNT(*) FROM contacts"
-        ).fetchone()[0]
-
-        total_deals = connection.execute(
-            "SELECT COUNT(*) FROM deals"
-        ).fetchone()[0]
-
-        total_value = connection.execute(
-            "SELECT COALESCE(SUM(value), 0) FROM deals"
-        ).fetchone()[0]
-
-        won_deals = connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM deals
-            WHERE LOWER(TRIM(stage)) = 'won'
-            """
-        ).fetchone()[0]
-
+@app.get("/dashboard", response_model=DashboardData)
+def get_dashboard_data():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM contacts")
+    total_contacts = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*), COALESCE(SUM(value), 0) FROM deals")
+    deal_stats = cursor.fetchone()
+    total_deals = deal_stats[0]
+    total_value = deal_stats[1]
+    
+    cursor.execute("SELECT COUNT(*) FROM deals WHERE stage = 'won'")
+    won_deals = cursor.fetchone()[0]
+    
+    conn.close()
+    
     return {
         "total_contacts": total_contacts,
         "total_deals": total_deals,
         "total_value": total_value,
-        "won_deals": won_deals,
+        "won_deals": won_deals
     }
+
+
+# ==========================================
+# 7. DATA INGESTION & EXPORT ENDPOINTS (v2 Pipeline)
+# ==========================================
+
+@app.post("/customers/ingest", status_code=status.HTTP_201_CREATED)
+def ingest_customer(payload: CustomerIngestSchema):
+    processed_data = process_and_segment_customer(payload.dict())
+    return processed_data
+
+@app.get("/customers/export")
+def export_customers_excel():
+    try:
+        excel_stream = generate_excel_report()
+        headers = {
+            "Content-Disposition": "attachment; filename=FairCRM_Customer_Report.xlsx"
+        }
+        return StreamingResponse(
+            excel_stream,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers=headers
+        )
+    except Exception as e:
+        logger.error(f"Excel export sırasında hata: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Excel raporu oluşturulamadı: {str(e)}"
+        )
