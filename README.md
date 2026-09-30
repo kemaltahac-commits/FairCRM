@@ -11,55 +11,54 @@ The project was developed as a portfolio-focused full-stack application with an 
 ## Features
 
 ### Contact Management
-
-- Create contacts
-- Edit contacts
-- Delete contacts
+- Create, edit, and delete contacts
 - Search and filter contacts
 - Store customer information in SQLite
-- Customer data normalization
-- Customer segmentation
+- Customer data normalization & automatic segmentation
 
 ### Deal Management
-
-- Create deals
-- Edit deals
-- Delete deals
-- Track deal stages
-- Track deal values
-- Associate deals with customers
-- Dashboard deal statistics
+- Create, edit, and delete deals
+- Track deal stages (Prospect, Won, Lost, etc.) and values
+- Associate deals with contacts
+- Dashboard deal statistics synchronization
 
 ### Task Management
-
-- Create tasks
-- Edit tasks
-- Delete tasks
+- Create, edit, and delete tasks
 - Mark tasks as completed
-- Track task-related activities
+- Track task-related business activities
 
-### Dashboard
-
-The dashboard provides business-level statistics including:
-
-- Total contacts
-- Total deals
-- Total deal value
-- Won deals
-- Customer statistics
+### Dashboard & Analytics
+- Total contacts & total deals overview
+- Total revenue value calculation & won deals metric
 - Customer segment distribution
+- Dynamic data retrieval from backend API backed by SQLite
 
-Dashboard data is retrieved from the backend API and persisted in the SQLite database.
+### Data Pipeline & Integration
+FairCRM includes a dedicated backend data-processing pipeline for external systems:
+- **Customer Data Ingestion**: `POST /customers/ingest` accepts JSON payloads for bulk/external integration.
+- **Excel Report Export**: `GET /customers/export` generates downloadable `.xlsx` financial and contact reports on the fly.
 
 ---
 
-## Data Pipeline & Integration
+## Tech Stack
 
-FairCRM also includes a backend data-processing pipeline for importing customer data from external systems.
+- **Frontend**: React (Vite), TypeScript, TailwindCSS
+- **Backend**: FastAPI (Python), Uvicorn, Pydantic, SQLite
+- **Automation**: Dual-service Windows Batch script (`start.bat`)
 
-### Customer Data Ingestion
+---
 
-External JSON data can be sent to:
+## Quick Start
 
-```text
-POST /customers/ingest
+### Prerequisites
+- Node.js (v18+)
+- Python (v3.10+)
+
+### Running the Application
+
+You can launch both the React frontend and FastAPI backend concurrently using the automated starter batch script:
+
+1. Double-click `start.bat` or run from terminal:
+   ```cmd
+   cmd /c start.bat
+Access the services:Frontend: http://localhost:5173Backend API Docs: http://127.0.0.1:8000/docsAPI Endpoints OverviewMethodEndpointDescriptionGET/contactsFetch all contactsPOST/contactsCreate a new contactGET/dealsFetch all dealsPOST/dealsCreate a new dealGET/dashboardFetch dashboard metricsPOST/customers/ingestProcess external customer JSON dataGET/customers/exportDownload dynamic Excel report
